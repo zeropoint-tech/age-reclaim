@@ -49,6 +49,10 @@ sudo ./age-reclaim.py /sys/fs/cgroup/ws --print-debug-stats --reclaim 120
 In the debug statistics of the tool, you should see a percentage of the cgroup's memory moved
 to the lower tier's NUMA node(s) after approximately 120 seconds.
 
+> [!NOTE]
+> By default, the tool reclaims both `anon` and `file` pages but it can be configured to reclaim
+> only `anon` or only `file` pages if desired. See `--help` for more details.
+
 ## How It Works
 
 This script leverages the Linux kernel's Multi-Gen LRU debugfs API to monitor page coldness within a cgroup and optionally reclaim cold pages based on an age threshold.

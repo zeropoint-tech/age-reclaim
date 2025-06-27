@@ -30,6 +30,13 @@ PAGE_SIZE_BYTES = 4096
 # Defined in include/linux/mmzone.h
 MAX_NR_GENS = 4
 
+
+# From mm/vmscan.c:isolate_folios():
+# Interpret swappiness 1 as file first and MAX_SWAPPINESS as anon first.
+# MAX_SWAPPINESS = 200 (defined in include/linux/swap.h)
+SWAPPINESS_FILE_FIRST = 1
+SWAPPINESS_ANON_FIRST = 200
+
 GEN_ADD_MONITOR_DELAY_SEC = 3
 
 CGGROUP_RE = re.compile(r"memcg\s+(\d+)\s+\/(.+)")
@@ -156,19 +163,49 @@ def lru_gen_add(cgroup_id: int, node_info: Dict[int, List[LRUGeneration]]):
         )
 
 
-def lru_gen_reclaim(cgroup_id: int, node: int, generation: LRUGeneration):
-    """Reclaim memory for a specific generation in a cgroup."""
-    min_gen_nr = generation.gen_nr
-    size_mb = generation.memory() / 2**20
-    logger.info(f"- {cgroup_id=} {node=} {min_gen_nr=} ({size_mb:.2f} MiB)")
-    try:
-        LRU_GEN_DEBUGFS.write_text(f"- {cgroup_id} {node} {min_gen_nr}\n")
-    except Exception as e:
-        logger.warning(f"Failed to reclaim memory: {e}")
+class ReclaimCommand:
+    """Command to reclaim memory for a specific MGLRU generation (either file, anon or both)."""
+
+    def __init__(
+        self,
+        cgroup_id: int,
+        node: int,
+        generation: LRUGeneration,
+        reclaim_anon: bool,
+        reclaim_file: bool,
+    ):
+        self.gen_nr = generation.gen_nr
+        self.cgroup_id = cgroup_id
+        self.node = node
+        self.swappiness = None
+        if reclaim_anon and reclaim_file:
+            self.nr_to_reclaim = generation.memory() // PAGE_SIZE_BYTES
+        elif reclaim_anon:
+            self.nr_to_reclaim = generation.anon // PAGE_SIZE_BYTES
+            self.swappiness = SWAPPINESS_ANON_FIRST
+        elif reclaim_file:
+            self.nr_to_reclaim = generation.file // PAGE_SIZE_BYTES
+            self.swappiness = SWAPPINESS_FILE_FIRST
+        else:
+            raise ValueError("At least one of anon or file must be set")
+
+    def command(self) -> str:
+        """Generate the command string for reclaiming memory."""
+        if self.swappiness is None:
+            # No need to pass nr_to_reclaim when reclaiming the whole generation
+            return f"- {self.cgroup_id} {self.node} {self.gen_nr}\n"
+        else:
+            return f"- {self.cgroup_id} {self.node} {self.gen_nr} {self.swappiness} {self.nr_to_reclaim}\n"
+
+    def __str__(self):
+        reclaim_mb = self.nr_to_reclaim * PAGE_SIZE_BYTES / 2**20
+        return f"- cgroup_id={self.cgroup_id} node={self.node} min_gen_nr={self.gen_nr} swappiness={self.swappiness} memory_mb={reclaim_mb:.2f}\n"
 
 
 def do_reclaim(
     cgroup_id: int,
+    reclaim_anon: bool,
+    reclaim_file: bool,
     reclaim_node: int,
     reclaim_age_sec: int,
     node_info: Dict[int, List[LRUGeneration]],
@@ -190,8 +227,30 @@ def do_reclaim(
             f"Skipping reclaim for node {reclaim_node}: no generations older than {reclaim_age_sec} seconds"
         )
         return
-    # Oldest generation (min gen_nr)
-    lru_gen_reclaim(cgroup_id, reclaim_node, cold_generations[0])
+
+    try:
+        # Reclaim oldest generation (min gen_nr)
+        reclaim_cmd = ReclaimCommand(
+            cgroup_id=cgroup_id,
+            node=reclaim_node,
+            generation=cold_generations[0],
+            reclaim_anon=reclaim_anon,
+            reclaim_file=reclaim_file,
+        )
+        logger.info(reclaim_cmd)
+        LRU_GEN_DEBUGFS.write_text(reclaim_cmd.command())
+    except Exception as e:
+        logger.warning(f"Failed to reclaim memory: {e}")
+
+
+def parse_bool(value: str) -> bool:
+    """Parse a string into a boolean value."""
+    if value.lower() in ("yes", "true", "1"):
+        return True
+    elif value.lower() in ("no", "false", "0"):
+        return False
+    else:
+        raise ValueError(f"Invalid boolean value: {value}")
 
 
 def main():
@@ -233,7 +292,22 @@ def main():
     parser.add_argument(
         "--allow-swap", action="store_true", help="Allow the cgroup to use swap"
     )
+    parser.add_argument(
+        "--anon",
+        type=parse_bool,
+        default=True,
+        help="Reclaim anonymous pages",
+    )
+    parser.add_argument(
+        "--file",
+        type=parse_bool,
+        default=True,
+        help="Reclaim file pages",
+    )
     args = parser.parse_args()
+
+    assert args.file or args.anon, "At least one of --file or --anon must be set"
+
     if args.reclaim:
         logger.info(
             f"Auto-tuning monitoring and monitor intervals for reclaiming {args.reclaim} seconds"
@@ -248,6 +322,8 @@ def main():
     logger.info(f"{'cgroup':<15} = {args.cgroup}")
     logger.info(f"{'cgroup_name':<15} = {cgroup_name}")
     logger.info(f"{'csv':<15} = {args.csv}")
+    logger.info(f"{'anon':<15} = {args.anon}")
+    logger.info(f"{'file':<15} = {args.file}")
     logger.info(f"{'reclaim':<15} = {args.reclaim}")
     logger.info(f"{'monitor':<15} = {args.monitor}")
     logger.info(f"{'print_debug_stats':<15} = {args.print_debug_stats}")
@@ -283,6 +359,8 @@ def main():
         if args.reclaim:
             do_reclaim(
                 cgroup_id=cgroup_id,
+                reclaim_anon=args.anon,
+                reclaim_file=args.file,
                 reclaim_node=args.reclaim_node,
                 reclaim_age_sec=args.reclaim,
                 node_info=node_info,
