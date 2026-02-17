@@ -18,6 +18,7 @@
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from collections import defaultdict
 from dataclasses import dataclass, asdict
+import errno
 import logging
 from pathlib import Path
 import re
@@ -103,6 +104,25 @@ def lru_gen_read(cgroup: str, print_debug_stats: bool):
     return cgroup_id, node_info
 
 
+def lru_gen_write(cmd: str) -> bool:
+    """Best-effort write to /sys/kernel/debug/lru_gen."""
+    try:
+        LRU_GEN_DEBUGFS.write_text(cmd)
+        return True
+    except OSError as e:
+        err_number = e.errno
+        if err_number is None:
+            logger.warning(
+                f"lru_gen command `{cmd.strip()}` failed due to write error: {e}"
+            )
+        else:
+            err_symbol = errno.errorcode.get(err_number, "UNKNOWN")
+            logger.warning(
+                f"lru_gen command `{cmd.strip()}` failed due to write error: {err_symbol} ({err_number})"
+            )
+        return False
+
+
 def debug_stats(node_info: Dict[int, List[LRUGeneration]]):
     total_memory = sum(
         sum(generation.memory() for generation in info) for info in node_info.values()
@@ -158,9 +178,10 @@ def lru_gen_add(cgroup_id: int, node_info: Dict[int, List[LRUGeneration]]):
     for node, info in node_info.items():
         max_gen_nr = max((gen.gen_nr for gen in info))
         logger.info(f"+ {cgroup_id=} {node=} {max_gen_nr=} {can_swap=} {force_scan=}")
-        LRU_GEN_DEBUGFS.write_text(
+        if not lru_gen_write(
             f"+ {cgroup_id} {node} {max_gen_nr} {can_swap} {force_scan}\n"
-        )
+        ):
+            logger.warning(f"Failed to add generation for node {node}")
 
 
 class ReclaimCommand:
@@ -228,19 +249,17 @@ def do_reclaim(
         )
         return
 
-    try:
-        # Reclaim oldest generation (min gen_nr)
-        reclaim_cmd = ReclaimCommand(
-            cgroup_id=cgroup_id,
-            node=reclaim_node,
-            generation=cold_generations[0],
-            reclaim_anon=reclaim_anon,
-            reclaim_file=reclaim_file,
-        )
-        logger.info(reclaim_cmd)
-        LRU_GEN_DEBUGFS.write_text(reclaim_cmd.command())
-    except Exception as e:
-        logger.warning(f"Failed to reclaim memory: {e}")
+    # Reclaim oldest generation (min gen_nr)
+    reclaim_cmd = ReclaimCommand(
+        cgroup_id=cgroup_id,
+        node=reclaim_node,
+        generation=cold_generations[0],
+        reclaim_anon=reclaim_anon,
+        reclaim_file=reclaim_file,
+    )
+    logger.info(reclaim_cmd)
+    if not lru_gen_write(reclaim_cmd.command()):
+        logger.error(f"Failed to reclaim memory for node {reclaim_node}")
 
 
 def parse_bool(value: str) -> bool:
